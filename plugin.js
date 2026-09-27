@@ -145,7 +145,7 @@ export async function episodes(ref) {
     VOD4 +
     "/series/" +
     encodeURIComponent(seriesId) +
-    "/seasons?offset=1000&page=1";
+    "/seasons?offset=0&page=0";
 
   const data = await getJson(url, {
     headers: {
