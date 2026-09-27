@@ -2,12 +2,38 @@ const API = "https://api.pluto.tv";
 const BOOT = "https://boot.pluto.tv/v4/start";
 const VOD4 = "https://service-vod.clusters.pluto.tv/v4/vod";
 const STITCHER = "https://service-stitcher.clusters.pluto.tv";
+const HUBS_GRAPHQL = "https://pluto.tv/api/tn/hubs/graphql/";
+const SEARCH_HASH = "83cd9a7dd069413377771f9d9dc822d7ed5eacecf67c1cad09a2008fbe6d49f0";
 const APP_VERSION = "5.100.1-a00ab03870075931f7b7df1e50eec1e31332ab4d";
 const CATEGORY_PAGE_SIZE = 100;
 const HOME_ITEMS = 20;
 const MAX_HOME_ROWS = 12;
 const MAX_SEARCH_CATEGORIES = 12;
 const MAX_SEARCH_RESULTS = 60;
+
+const FULL_EPISODES_QUERY = `query FullEpisodesData(
+  $showId: String!,
+  $seasonNum: String,
+  $apiRawContentId: String,
+  $withApiRaw: Boolean = false,
+  $begin: Int
+) {
+  fullEpisodes(
+    showId: $showId,
+    seasonNum: $seasonNum,
+    apiRawContentId: $apiRawContentId,
+    begin: $begin
+  ) {
+    episodes {
+      title label seriesTitle seasonNum episodeNum airDateISO thumb href
+      description shortDescription duration contentId showPageUrl streamingUrl
+      genre regionalRating { ratingIcon rating } premiumFeatures
+      isEpisodeless isSeasonless
+      _apiRaw @include(if: $withApiRaw)
+    }
+    slug availableSeasonNums hasMore
+  }
+}`;
 
 const BASE_HEADERS = {
   Accept: "application/json",
@@ -25,6 +51,36 @@ async function getJson(url, options = {}) {
 
 function headers(extra = {}) {
   return { ...BASE_HEADERS, ...extra };
+}
+
+async function graphql(operationName, variables, referer, options = {}) {
+  const body = options.hash
+    ? {
+        operationName,
+        variables,
+        extensions: { tnPersistedDocumentHash: options.hash }
+      }
+    : {
+        operationName,
+        variables,
+        query: options.query
+      };
+  const response = await kino.fetch(HUBS_GRAPHQL, {
+    method: "POST",
+    headers: headers({
+      "Content-Type": "application/json",
+      Referer: referer,
+      "apollo-require-preflight": "true",
+      "x-apollo-operation-name": operationName
+    }),
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) throw kino.error("unavailable", "Pluto TV respondió " + response.status);
+  const payload = await response.json();
+  if (Array.isArray(payload.errors) && payload.errors.length) {
+    throw kino.error("unavailable", "Pluto TV no pudo completar la consulta");
+  }
+  return payload.data || {};
 }
 
 async function boot(seriesId = "") {
@@ -281,15 +337,79 @@ export async function browse(ref, cursor) {
   return { items, next };
 }
 
+function makeSearchItem(source) {
+  const title = string(source.title || source.showTitle);
+  const sourceType = string(source.contentType).toLowerCase();
+  const kind = sourceType === "show" || sourceType === "series" ? "series"
+    : sourceType === "movie" ? "movie" : "";
+  const id = string(source.id || source.movieId);
+  if (!title || !id || !kind) return null;
+  const href = string(source.href);
+  const slug = href.match(/\/shows\/([^/?#]+)/i)?.[1] || "";
+  const ref = JSON.stringify({
+    kind,
+    id,
+    seriesId: kind === "series" ? id : "",
+    slug,
+    title
+  });
+  const duration = Number(source.movieDuration || source.duration || 0);
+  return {
+    id: "pluto-" + kind + "-" + id,
+    ref,
+    title,
+    kind,
+    year: releaseYear(source),
+    poster: source.thumb || source.thumbLandscape || source.hero || undefined,
+    overview: string(source.description) || undefined,
+    genres: source.genre ? [string(source.genre)] : undefined,
+    runtimeMinutes: duration > 0 ? Math.round(duration / 60) : undefined,
+    badges: ["Pluto TV" ]
+  };
+}
+
+async function searchGraphQL(phrase) {
+  const referer = "https://pluto.tv/latam/search/?term=" + encodeURIComponent(phrase);
+  const data = await graphql("GetVODContent", { query: phrase, extraParams: {} }, referer, { hash: SEARCH_HASH });
+  const results = data.searchVODContent?.data;
+  return Array.isArray(results) ? results.map(makeSearchItem).filter(Boolean) : [];
+}
+
 export async function search(query) {
   const primary = string(query && query.q);
   if (primary.length < 2) return [];
 
-  // Pluto exposes no confirmed global VOD search endpoint. Search a bounded set of
-  // curated shelves in parallel; this is useful but is not a full-catalogue search.
+  // Pluto's LATAM site uses the global VOD GraphQL search. Keep shelf matching as
+  // a resilient fallback for items the site search does not index.
   const phrases = [primary, string(query && query.originalTitle), ...(Array.isArray(query && query.altTitles) ? query.altTitles : [])]
     .map(string)
     .filter((phrase, index, all) => phrase.length >= 2 && all.indexOf(phrase) === index);
+
+  const gqlResults = [];
+  const gqlSeen = new Set();
+  for (const phrase of phrases) {
+    try {
+      const found = await searchGraphQL(phrase);
+      const exactMatches = found.filter(item => queryMatches(item, phrase));
+      for (const item of (exactMatches.length ? exactMatches : found)) {
+        if (gqlSeen.has(item.id)) continue;
+        gqlSeen.add(item.id);
+        gqlResults.push(item);
+        if (gqlResults.length >= MAX_SEARCH_RESULTS) break;
+      }
+    } catch (_) {
+      // Continue to the existing shelf search if Pluto's site search is unavailable.
+    }
+    if (gqlResults.length >= MAX_SEARCH_RESULTS) break;
+  }
+  if (gqlResults.length) {
+    const wantedType = string(query && query.type).toLowerCase();
+    if (wantedType === "movie" || wantedType === "series") {
+      gqlResults.sort((a, b) => Number(b.kind === wantedType) - Number(a.kind === wantedType));
+    }
+    return gqlResults;
+  }
+
   const categories = await getCategories();
   const selected = matchingCategories(categories, SEARCH_PATTERNS, MAX_SEARCH_CATEGORIES);
   const pages = await Promise.all(selected.map(async category => {
@@ -336,37 +456,50 @@ export async function episodes(ref) {
   const seriesId = string(seriesRef.seriesId || seriesRef.id);
   if (!seriesId) throw kino.error("not_found", "No se encontró la serie en Pluto TV");
 
-  const session = await boot(seriesId);
-  const url = VOD4 + "/series/" + encodeURIComponent(seriesId) + "/seasons?offset=0&page=0";
-  const data = await getJson(url, {
-    headers: headers({ Authorization: "Bearer " + session.sessionToken })
-  });
-  const seasons = Array.isArray(data) ? data : Array.isArray(data.seasons) ? data.seasons : [];
-  const result = [];
+  const referer = "https://pluto.tv/latam/shows/" + encodeURIComponent(seriesRef.slug || seriesId) + "/season/1/";
+  const firstData = await graphql("FullEpisodesData", { showId: seriesId }, referer, { query: FULL_EPISODES_QUERY });
+  const firstSeason = firstData.fullEpisodes;
+  if (!firstSeason) throw kino.error("not_found", "Pluto TV no devolvió episodios para esta serie");
+  const seasonNumbers = Array.isArray(firstSeason.availableSeasonNums)
+    ? firstSeason.availableSeasonNums.map(value => Number(value)).filter(value => value > 0)
+    : [];
+  const seasons = seasonNumbers.length ? seasonNumbers : [1];
+  const grouped = new Map();
+  for (const episode of (firstSeason.episodes || [])) {
+    const num = Number(episode.seasonNum) || seasons[0] || 1;
+    if (!grouped.has(num)) grouped.set(num, []);
+    grouped.get(num).push(episode);
+  }
 
-  for (const season of seasons) {
-    const seasonNumber = Number(season.number || season.seasonNumber || 1);
-    const list = Array.isArray(season.episodes) ? season.episodes : [];
+  await Promise.all(seasons.map(async seasonNumber => {
+    if (grouped.has(seasonNumber)) return;
+    const data = await graphql(
+      "FullEpisodesData",
+      { showId: seriesId, seasonNum: String(seasonNumber) },
+      "https://pluto.tv/latam/shows/" + encodeURIComponent(seriesRef.slug || seriesId) + "/season/" + seasonNumber + "/",
+      { query: FULL_EPISODES_QUERY }
+    );
+    grouped.set(seasonNumber, data.fullEpisodes?.episodes || []);
+  }));
+
+  const result = [];
+  for (const seasonNumber of seasons) {
+    const list = grouped.get(seasonNumber) || [];
     for (let i = 0; i < list.length; i++) {
       const episode = list[i];
-      const id = string(episode._id || episode.id || episode.episodeID);
+      const id = string(episode.contentId);
       if (!id) continue;
-      const number = Number(episode.number || episode.episodeNumber || i + 1);
+      const number = Number(episode.episodeNum) || i + 1;
+      const title = string(episode.label || episode.title) || "Episodio " + number;
       result.push({
-        season: seasonNumber > 0 ? seasonNumber : 1,
+        season: Number(episode.seasonNum) || seasonNumber,
         number,
-        ref: JSON.stringify({
-          kind: "episode",
-          id,
-          seriesId,
-          path: mediaPath(episode),
-          title: string(episode.name || episode.title)
-        }),
-        title: string(episode.name || episode.title) || "Episodio " + number,
-        overview: string(episode.description || episode.summary) || undefined,
-        still: image(episode),
-        airDate: episode.originalReleaseDate ? String(episode.originalReleaseDate).slice(0, 10) : undefined,
-        runtimeMinutes: Number(episode.duration) > 0 ? Math.round(Number(episode.duration) / 60000) : undefined
+        ref: JSON.stringify({ kind: "episode", id, seriesId, title }),
+        title,
+        overview: string(episode.description || episode.shortDescription) || undefined,
+        still: episode.thumb || undefined,
+        airDate: episode.airDateISO ? String(episode.airDateISO).slice(0, 10) : undefined,
+        runtimeMinutes: Number(episode.duration) > 0 ? Math.round(Number(episode.duration) / 60) : undefined
       });
     }
   }

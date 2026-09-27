@@ -1,7 +1,7 @@
 {
   "id": "pluto-tv",
   "name": "Pluto TV",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "apiVersion": 1,
   "entry": "plugin.js",
   "description": "Catálogo y reproducción de Pluto TV (VOD) dentro de Kino.",
@@ -11,10 +11,13 @@
     "boot.pluto.tv",
     "service-vod.clusters.pluto.tv",
     "service-stitcher.clusters.pluto.tv",
+    "pluto.tv",
     "*.pluto.tv",
     "*.clusters.pluto.tv",
     "plutotv.net",
-    "*.plutotv.net"
+    "*.plutotv.net",
+    "thumbnails.cbsig.net",
+    "wwwimage-us.plutostatic.tv"
   ],
   "capabilities": [
     "search",
